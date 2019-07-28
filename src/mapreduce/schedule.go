@@ -38,7 +38,6 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		wg.Add(1)
 		go func(task_num int) {
 			defer wg.Done()
-			worker := <-registerChan
 			args := DoTaskArgs{
 				JobName:       jobName,
 				File:          mapFiles[task_num],
@@ -46,8 +45,14 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				TaskNumber:    task_num,
 				NumOtherPhase: n_other, // for map, its nReduce. And vice-versa
 			}
-			call(worker, "Worker.DoTask", args, nil)
-			go func() { registerChan <- worker }()
+			for {
+				worker := <-registerChan
+				ok := call(worker, "Worker.DoTask", args, nil)
+				if ok {
+					go func() { registerChan <- worker }()
+					break
+				}
+			}
 		}(i)
 	}
 	wg.Wait()
