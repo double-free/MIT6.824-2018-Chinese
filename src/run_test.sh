@@ -4,5 +4,5 @@ if [ $# -ne 1 ]; then
 	exit 1
 fi
 export "GOPATH=$(git rev-parse --show-toplevel)"
-cd "${GOPATH}/src/mapreduce"
+cd "${GOPATH}/src/raft"
 go test -run $1
