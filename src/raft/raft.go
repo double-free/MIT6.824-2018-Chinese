@@ -94,6 +94,11 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -111,6 +116,13 @@ type Raft struct {
 	electionTimer  *time.Timer // 2A
 	heartbeatTimer *time.Timer // 2A
 	state          NodeState   // 2A
+
+	logs        []LogEntry    // 2B
+	commitIndex int           // 2B
+	lastApplied int           // 2B
+	nextIndex   []int         // 2B
+	matchIndex  []int         // 2B
+	applyCh     chan ApplyMsg // 2B
 }
 
 func (rf Raft) String() string {
@@ -177,6 +189,9 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int // 2A
 	CandidateId int // 2A
+
+	LastLogIndex int // 2B
+	LastLogTerm  int // 2B
 }
 
 //
@@ -197,7 +212,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
 	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1) {
-		DPrintf("%v did not vote for node %d at term %d\n", rf, args.CandidateId, args.Term)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	// 2B: candidate's vote should be at least up-to-date as receiver's log
+	// "up-to-date" is defined in thesis 5.4.1
+	lastLogIndex := len(rf.logs) - 1
+	if args.LastLogTerm < rf.logs[lastLogIndex].Term ||
+		(args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex < lastLogIndex) {
+		// Receiver is more up-to-date, does not grant vote
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -214,6 +239,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 type AppendEntriesArgs struct {
 	Term     int // 2A
 	LeaderId int // 2A
+
+	PrevLogIndex int        // 2B
+	PrevLogTerm  int        // 2B
+	LogEntries   []LogEntry // 2B
+	LeaderCommit int        // 2B
 }
 
 type AppendEntriesReply struct {
@@ -229,34 +259,131 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
+
+	// entries before args.PrevLogIndex might be unmatch
+	// return false and ask Leader to decrement PrevLogIndex
+	if len(rf.logs) < args.PrevLogIndex+1 ||
+		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// compare from rf.logs[args.PrevLogIndex + 1]
+	unmatch_idx := -1
+	for idx := range args.LogEntries {
+		if len(rf.logs) < args.PrevLogIndex+2+idx ||
+			rf.logs[args.PrevLogIndex+1+idx].Term != args.LogEntries[idx].Term {
+			// unmatch log found
+			unmatch_idx = idx
+			break
+		}
+	}
+
+	if unmatch_idx != -1 {
+		// there are unmatch entries
+		// truncate unmatch Follower entries, and apply Leader entries
+		rf.logs = rf.logs[:args.PrevLogIndex+1+unmatch_idx]
+		rf.logs = append(rf.logs, args.LogEntries[unmatch_idx:]...)
+	}
+
+	// Leader guarantee to have all committed entries
+	// TODO: Is that possible for lastLogIndex < args.LeaderCommit?
+	if args.LeaderCommit > rf.commitIndex {
+		lastLogIndex := len(rf.logs) - 1
+		if args.LeaderCommit <= lastLogIndex {
+			rf.commitIndex = args.LeaderCommit
+		} else {
+			rf.commitIndex = lastLogIndex
+		}
+		rf.apply()
+	}
+
 	reply.Success = true
 	rf.currentTerm = args.Term
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 	rf.convertTo(Follower)
 }
 
+// should be called with a lock
+func (rf *Raft) apply() {
+	// apply all entries between lastApplied and committed
+	// should be called after commitIndex updated
+	if rf.commitIndex > rf.lastApplied {
+		go func(start_idx int, entries []LogEntry) {
+			for idx, entry := range entries {
+				DPrintf("%v applies command %d on index %d", rf, entry.Command.(int), start_idx+idx)
+				var msg ApplyMsg
+				msg.CommandValid = true
+				msg.Command = entry.Command
+				msg.CommandIndex = start_idx + idx
+				rf.applyCh <- msg
+			}
+		}(rf.lastApplied+1, rf.logs[rf.lastApplied+1:rf.commitIndex+1])
+	}
+}
+
 // should be called with lock
 func (rf *Raft) broadcastHeartbeat() {
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(server int) {
+			rf.mu.Lock()
+			if rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+
+			prevLogIndex := rf.nextIndex[server] - 1
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  rf.logs[prevLogIndex].Term,
+				LogEntries:   rf.logs[rf.nextIndex[server]:],
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
 			var reply AppendEntriesReply
 			if rf.sendAppendEntries(server, &args, &reply) {
 				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.convertTo(Follower)
+				if reply.Success {
+					// successfully replicated args.LogEntries
+					rf.matchIndex[server] = args.PrevLogIndex + len(args.LogEntries)
+					rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+					// check if we need to update commitIndex
+					// from the last log entry to committed one
+					for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
+						count := 1 // self must be agreed
+						for _, matchIndex := range rf.matchIndex {
+							if matchIndex >= i {
+								count += 1
+							}
+						}
+
+						if count > len(rf.peers)/2 {
+							// most of nodes agreed on rf.logs[i]
+							rf.commitIndex = i
+							rf.apply()
+							break
+						}
+					}
+
+				} else {
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.convertTo(Follower)
+					} else {
+						// log unmatch
+						rf.nextIndex[server] -= 1
+						// TODO: retry now or later?
+					}
 				}
 				rf.mu.Unlock()
-			} else {
-				DPrintf("%v send request vote to %d failed", rf, server)
 			}
 		}(i)
 	}
@@ -267,9 +394,12 @@ func (rf *Raft) startElection() {
 	rf.currentTerm += 1
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
+	lastLogIndex := len(rf.logs) - 1
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  rf.logs[lastLogIndex].Term,
 	}
 
 	var voteCount int32
@@ -297,8 +427,6 @@ func (rf *Raft) startElection() {
 					}
 				}
 				rf.mu.Unlock()
-			} else {
-				DPrintf("%v send request vote to %d failed", rf, server)
 			}
 		}(i)
 	}
@@ -363,6 +491,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	term, isLeader = rf.GetState()
+	if isLeader {
+		rf.mu.Lock()
+		index = len(rf.logs)
+		rf.logs = append(rf.logs, LogEntry{Command: command, Term: term})
+		rf.nextIndex[rf.me] = index + 1
+		DPrintf("%v start agreement on command %d on index %d", rf, command.(int), index)
+		rf.mu.Unlock()
+	}
 
 	return index, term, isLeader
 }
@@ -401,6 +538,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimer = time.NewTimer(HeartbeatInterval)
 	rf.electionTimer = time.NewTimer(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 	rf.state = Follower
+
+	rf.applyCh = applyCh
+	rf.logs = make([]LogEntry, 1) // start from index 1
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		// initialize with 1
+		rf.nextIndex[i] = 1
+	}
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	go func(node *Raft) {
 		for {
