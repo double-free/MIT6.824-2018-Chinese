@@ -71,6 +71,14 @@ func (rf *Raft) convertTo(s NodeState) {
 		rf.startElection()
 
 	case Leader:
+		for i := range rf.nextIndex {
+			// initialized to leader last log index + 1
+			rf.nextIndex[i] = len(rf.logs)
+		}
+		for i := range rf.matchIndex {
+			rf.matchIndex[i] = 0
+		}
+
 		rf.electionTimer.Stop()
 		rf.broadcastHeartbeat()
 		rf.heartbeatTimer.Reset(HeartbeatInterval)
@@ -211,10 +219,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Your code here (2A, 2B).
-	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.votedFor != -1) {
+	if args.Term < rf.currentTerm ||
+		(args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.convertTo(Follower)
+		// do not return here.
 	}
 
 	// 2B: candidate's vote should be at least up-to-date as receiver's log
@@ -229,11 +244,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.votedFor = args.CandidateId
-	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm // not used, for better logging
 	reply.VoteGranted = true
 	// reset timer after grant vote
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
-	rf.convertTo(Follower)
 }
 
 type AppendEntriesArgs struct {
@@ -259,6 +273,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.convertTo(Follower)
+		// do not return here.
+	}
+
+	// reset election timer even log does not match
+	// args.LeaderId is the current term's Leader
+	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
 	// entries before args.PrevLogIndex might be unmatch
 	// return false and ask Leader to decrement PrevLogIndex
@@ -300,9 +324,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	rf.currentTerm = args.Term
-	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
-	rf.convertTo(Follower)
 }
 
 // should be called with a lock
@@ -318,6 +339,11 @@ func (rf *Raft) apply() {
 				msg.Command = entry.Command
 				msg.CommandIndex = start_idx + idx
 				rf.applyCh <- msg
+				// do not forget to update lastApplied index
+				// this is another goroutine, so protect it with lock
+				rf.mu.Lock()
+				rf.lastApplied = msg.CommandIndex
+				rf.mu.Unlock()
 			}
 		}(rf.lastApplied+1, rf.logs[rf.lastApplied+1:rf.commitIndex+1])
 	}
@@ -358,7 +384,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					// check if we need to update commitIndex
 					// from the last log entry to committed one
 					for i := len(rf.logs) - 1; i > rf.commitIndex; i-- {
-						count := 1 // self must be agreed
+						count := 0
 						for _, matchIndex := range rf.matchIndex {
 							if matchIndex >= i {
 								count += 1
@@ -414,7 +440,8 @@ func (rf *Raft) startElection() {
 			var reply RequestVoteReply
 			if rf.sendRequestVote(server, &args, &reply) {
 				rf.mu.Lock()
-
+				DPrintf("%v got RequestVote response from node %d, VoteGranted=%v, Term=%d",
+					rf, server, reply.VoteGranted, reply.Term)
 				if reply.VoteGranted && rf.state == Candidate {
 					atomic.AddInt32(&voteCount, 1)
 					if atomic.LoadInt32(&voteCount) > int32(len(rf.peers)/2) {
@@ -496,6 +523,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		index = len(rf.logs)
 		rf.logs = append(rf.logs, LogEntry{Command: command, Term: term})
+		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		DPrintf("%v start agreement on command %d on index %d", rf, command.(int), index)
 		rf.mu.Unlock()
@@ -543,8 +571,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = make([]LogEntry, 1) // start from index 1
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
-		// initialize with 1
-		rf.nextIndex[i] = 1
+		// initialized to leader last log index + 1
+		rf.nextIndex[i] = len(rf.logs)
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
 
