@@ -314,6 +314,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 2A
 	Success bool // 2A
+
+	// OPTIMIZE: see thesis section 5.3
+	ConflictTerm  int // 2C
+	ConflictIndex int // 2C
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -338,10 +342,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// entries before args.PrevLogIndex might be unmatch
 	// return false and ask Leader to decrement PrevLogIndex
-	if len(rf.logs) < args.PrevLogIndex+1 ||
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.logs) < args.PrevLogIndex+1 {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		// optimistically thinks receiver's log matches with Leader's as a subset
+		reply.ConflictIndex = len(rf.logs)
+		// no conflict term
+		reply.ConflictTerm = -1
+		return
+	}
+
+	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		// receiver's log in certain term unmatches Leader's log
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+
+		// expecting Leader to check the former term
+		// so set ConflictIndex to the first one of entries in ConflictTerm
+		conflictIndex := args.PrevLogIndex
+		// apparently, since rf.logs[0] are ensured to match among all servers
+		// ConflictIndex must be > 0, safe to minus 1
+		for rf.logs[conflictIndex-1].Term == reply.ConflictTerm {
+			conflictIndex--
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
@@ -391,6 +416,7 @@ func (rf *Raft) broadcastHeartbeat() {
 			}
 
 			prevLogIndex := rf.nextIndex[server] - 1
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -432,9 +458,22 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.convertTo(Follower)
 						rf.persist()
 					} else {
-						// log unmatch
-						rf.nextIndex[server] -= 1
-						// TODO: retry now or later?
+						// log unmatch, update nextIndex[server] for the next trial
+						rf.nextIndex[server] = reply.ConflictIndex
+
+						// if term found, override it to
+						// the first entry after entries in ConflictTerm
+						if reply.ConflictTerm != -1 {
+							for i := args.PrevLogIndex; i >= 1; i-- {
+								if rf.logs[i-1].Term == reply.ConflictTerm {
+									// in next trial, check if log entries in ConflictTerm matches
+									rf.nextIndex[server] = i
+									break
+								}
+							}
+						}
+
+						// TODO: retry now or in next RPC?
 					}
 				}
 				rf.mu.Unlock()
