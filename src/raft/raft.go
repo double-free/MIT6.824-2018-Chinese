@@ -24,8 +24,8 @@ import "math/rand"
 import "sync/atomic"
 import "fmt"
 
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
 
 const (
 	HeartbeatInterval    = time.Duration(120) * time.Millisecond
@@ -138,6 +138,34 @@ func (rf Raft) String() string {
 		rf.me, rf.state, rf.currentTerm, rf.votedFor)
 }
 
+//
+// several setters, should be called with a lock
+//
+
+func (rf *Raft) setCommitIndex(commitIndex int) {
+	rf.commitIndex = commitIndex
+
+	// apply all entries between lastApplied and committed
+	// should be called after commitIndex updated
+	if rf.commitIndex > rf.lastApplied {
+		go func(start_idx int, entries []LogEntry) {
+			for idx, entry := range entries {
+				DPrintf("%v applies command %d on index %d", rf, entry.Command.(int), start_idx+idx)
+				var msg ApplyMsg
+				msg.CommandValid = true
+				msg.Command = entry.Command
+				msg.CommandIndex = start_idx + idx
+				rf.applyCh <- msg
+				// do not forget to update lastApplied index
+				// this is another goroutine, so protect it with lock
+				rf.mu.Lock()
+				rf.lastApplied = msg.CommandIndex
+				rf.mu.Unlock()
+			}
+		}(rf.lastApplied+1, rf.logs[rf.lastApplied+1:rf.commitIndex+1])
+	}
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -165,6 +193,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -187,6 +222,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		DPrintf("%v fails to recover from persist", rf)
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logs = logs
 }
 
 //
@@ -218,6 +268,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist() // execute before rf.mu.Unlock()
 	// Your code here (2A, 2B).
 	if args.Term < rf.currentTerm ||
 		(args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId) {
@@ -268,6 +319,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist() // execute before rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -316,37 +368,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		lastLogIndex := len(rf.logs) - 1
 		if args.LeaderCommit <= lastLogIndex {
-			rf.commitIndex = args.LeaderCommit
+			rf.setCommitIndex(args.LeaderCommit)
 		} else {
-			rf.commitIndex = lastLogIndex
+			rf.setCommitIndex(lastLogIndex)
 		}
-		rf.apply()
 	}
 
 	reply.Success = true
-}
-
-// should be called with a lock
-func (rf *Raft) apply() {
-	// apply all entries between lastApplied and committed
-	// should be called after commitIndex updated
-	if rf.commitIndex > rf.lastApplied {
-		go func(start_idx int, entries []LogEntry) {
-			for idx, entry := range entries {
-				DPrintf("%v applies command %d on index %d", rf, entry.Command.(int), start_idx+idx)
-				var msg ApplyMsg
-				msg.CommandValid = true
-				msg.Command = entry.Command
-				msg.CommandIndex = start_idx + idx
-				rf.applyCh <- msg
-				// do not forget to update lastApplied index
-				// this is another goroutine, so protect it with lock
-				rf.mu.Lock()
-				rf.lastApplied = msg.CommandIndex
-				rf.mu.Unlock()
-			}
-		}(rf.lastApplied+1, rf.logs[rf.lastApplied+1:rf.commitIndex+1])
-	}
 }
 
 // should be called with lock
@@ -393,8 +421,7 @@ func (rf *Raft) broadcastHeartbeat() {
 
 						if count > len(rf.peers)/2 {
 							// most of nodes agreed on rf.logs[i]
-							rf.commitIndex = i
-							rf.apply()
+							rf.setCommitIndex(i)
 							break
 						}
 					}
@@ -403,6 +430,7 @@ func (rf *Raft) broadcastHeartbeat() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					} else {
 						// log unmatch
 						rf.nextIndex[server] -= 1
@@ -417,6 +445,8 @@ func (rf *Raft) broadcastHeartbeat() {
 
 // should be called with lock
 func (rf *Raft) startElection() {
+	defer rf.persist()
+
 	rf.currentTerm += 1
 	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
@@ -451,6 +481,7 @@ func (rf *Raft) startElection() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.convertTo(Follower)
+						rf.persist()
 					}
 				}
 				rf.mu.Unlock()
@@ -526,6 +557,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		DPrintf("%v start agreement on command %d on index %d", rf, command.(int), index)
+		rf.persist()
 		rf.mu.Unlock()
 	}
 
@@ -601,7 +633,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}(rf)
 
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
 
 	return rf
 }
