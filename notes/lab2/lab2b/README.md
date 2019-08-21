@@ -202,8 +202,110 @@ args := AppendEntriesArgs{
   LeaderCommit: rf.commitIndex,
 }
 ```
-`PrevLogTerm:  rf.logs[prevLogIndex].Term` 这一行出错，出错时间是一个掉线的 node 刚被选为 Leader。
-原因是在被选举为 Leader 时没有重置 `nextIndex` 和 `matchIndex`
+`PrevLogTerm:  rf.logs[prevLogIndex].Term` 这一行出错，其原因是一个隐藏非常深的 race condition。
+
+```
+==================
+WARNING: DATA RACE
+Write at 0x00c0003184e0 by goroutine 366:
+  runtime.slicecopy()
+      /usr/local/go/src/runtime/slice.go:221 +0x0
+  raft.(*Raft).AppendEntries()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/raft/raft.go:387 +0x97e
+  runtime.call32()
+      /usr/local/go/src/runtime/asm_amd64.s:522 +0x3a
+  reflect.Value.Call()
+      /usr/local/go/src/reflect/value.go:308 +0xc0
+  labrpc.(*Service).dispatch()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/labrpc/labrpc.go:478 +0x84f
+  labrpc.(*Server).dispatch()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/labrpc/labrpc.go:402 +0x680
+  labrpc.(*Network).ProcessReq.func1()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/labrpc/labrpc.go:229 +0x93
+
+Previous read at 0x00c0003184e0 by goroutine 101:
+  encoding/gob.encOpFor.func5()
+      /usr/local/go/src/reflect/value.go:1046 +0x172
+  encoding/gob.(*Encoder).encodeStruct()
+      /usr/local/go/src/encoding/gob/encode.go:328 +0x401
+  encoding/gob.encOpFor.func4()
+      /usr/local/go/src/encoding/gob/encode.go:581 +0xfa
+  encoding/gob.(*Encoder).encodeArray()
+      /usr/local/go/src/encoding/gob/encode.go:351 +0x224
+  encoding/gob.encOpFor.func1()
+      /usr/local/go/src/encoding/gob/encode.go:551 +0x1a0
+  encoding/gob.(*Encoder).encodeStruct()
+      /usr/local/go/src/encoding/gob/encode.go:328 +0x401
+  encoding/gob.(*Encoder).encode()
+      /usr/local/go/src/encoding/gob/encode.go:701 +0x246
+  encoding/gob.(*Encoder).EncodeValue()
+      /usr/local/go/src/encoding/gob/encoder.go:250 +0x613
+  encoding/gob.(*Encoder).Encode()
+      /usr/local/go/src/encoding/gob/encoder.go:175 +0x63
+  labgob.(*LabEncoder).Encode()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/labgob/labgob.go:34 +0x7b
+  labrpc.(*ClientEnd).Call()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/labrpc/labrpc.go:93 +0x170
+  raft.(*Raft).sendAppendEntries()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/raft/raft.go:569 +0xc7
+  raft.(*Raft).broadcastHeartbeat.func1()
+      /Users/yy/YuanYe/Projects/github/MIT6.824-2018-Chinese/src/raft/raft.go:433 +0x47e
+```
+发生 race 的两个地方是
+
+```go
+args := AppendEntriesArgs{
+	Term:         rf.currentTerm,
+	LeaderId:     rf.me,
+	PrevLogIndex: prevLogIndex,
+	PrevLogTerm:  rf.logs[prevLogIndex].Term,
+	LogEntries:   rf.logs[rf.nextIndex[server]:],
+	LeaderCommit: rf.commitIndex,
+}
+rf.mu.Unlock()
+
+var reply AppendEntriesReply
+if rf.sendAppendEntries(server, &args, &reply) // race here
+```
+
+以及
+
+```go
+if unmatch_idx != -1 {
+	// there are unmatch entries
+	// truncate unmatch Follower entries, and apply Leader entries
+	rf.logs = rf.logs[:args.PrevLogIndex+1+unmatch_idx]
+	rf.logs = append(rf.logs, args.LogEntries[unmatch_idx:]...)
+}
+
+```
+
+即，我们在对心跳包发送的 entries 进行 encoding 的时候，同时另一个地方正在对这些 entries 进行修改。
+这是完全可能发生的，因为我们的主旨是不对 RPC 调用加锁（否则无法并行），但是此时就要考虑以下情况：
+
+- Leader 正在发送心跳包
+- Leader 由于某些原因转为了 Follower，log 被新的 Leader 改写
+
+这时，就可能出现 Leader 的 log 同时被读写的情况。为了避免这种情况，我们需要在 encoding 的时候，
+将 entries 拷贝出来。而不是直接从 log 读取。
+
+```go
+prevLogIndex := rf.nextIndex[server] - 1
+
+// use deep copy to avoid race condition
+// when override log in AppendEntries()
+entries := make([]LogEntry, len(rf.logs[prevLogIndex+1:]))
+copy(entries, rf.logs[prevLogIndex+1:])
+
+args := AppendEntriesArgs{
+	Term:         rf.currentTerm,
+	LeaderId:     rf.me,
+	PrevLogIndex: prevLogIndex,
+	PrevLogTerm:  rf.logs[prevLogIndex].Term,
+	LogEntries:   entries,
+	LeaderCommit: rf.commitIndex,
+}
+```
 
 ## 总结
 加入 log 这一个因素后，Leader 的选举也随之复杂很多。大部分 bug 都是无法在短时间内选出 Leader 导致的。

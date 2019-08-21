@@ -150,7 +150,6 @@ func (rf *Raft) setCommitIndex(commitIndex int) {
 	if rf.commitIndex > rf.lastApplied {
 		go func(start_idx int, entries []LogEntry) {
 			for idx, entry := range entries {
-				DPrintf("%v applies command %d on index %d", rf, entry.Command.(int), start_idx+idx)
 				var msg ApplyMsg
 				msg.CommandValid = true
 				msg.Command = entry.Command
@@ -417,12 +416,17 @@ func (rf *Raft) broadcastHeartbeat() {
 
 			prevLogIndex := rf.nextIndex[server] - 1
 
+			// use deep copy to avoid race condition
+			// when override log in AppendEntries()
+			entries := make([]LogEntry, len(rf.logs[prevLogIndex+1:]))
+			copy(entries, rf.logs[prevLogIndex+1:])
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  rf.logs[prevLogIndex].Term,
-				LogEntries:   rf.logs[rf.nextIndex[server]:],
+				LogEntries:   entries,
 				LeaderCommit: rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -595,7 +599,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, LogEntry{Command: command, Term: term})
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
-		DPrintf("%v start agreement on command %d on index %d", rf, command.(int), index)
 		rf.persist()
 		rf.mu.Unlock()
 	}
