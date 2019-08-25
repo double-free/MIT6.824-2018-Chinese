@@ -5,7 +5,7 @@ if [ $# -ne 2 ]; then
 	exit 1
 fi
 export "GOPATH=$(git rev-parse --show-toplevel)"
-cd "${GOPATH}/src/raft"
+cd "${GOPATH}/src/kvraft"
 for ((i=0;i<$2;i++))
 do
 	time go test -run $1

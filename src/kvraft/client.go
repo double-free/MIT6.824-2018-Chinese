@@ -4,10 +4,12 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId      int
+	clientId      int64
+	lastRequestId int
 }
 
 func nrand() int64 {
@@ -21,6 +23,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand() // in real world the id can be a unique ip:port
 	return ck
 }
 
@@ -39,6 +42,25 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	requestId := ck.lastRequestId + 1
+
+	for {
+		args := GetArgs{
+			Key:       key,
+			ClientId:  ck.clientId,
+			RequestId: requestId,
+		}
+		var reply GetReply
+
+		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		if ok == false || reply.WrongLeader == true {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			continue
+		}
+		// request is sent successfully
+		ck.lastRequestId = requestId
+		return reply.Value
+	}
 	return ""
 }
 
@@ -54,6 +76,26 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	requestId := ck.lastRequestId + 1
+	for {
+		args := PutAppendArgs{
+			Key:       key,
+			Value:     value,
+			Op:        op,
+			ClientId:  ck.clientId,
+			RequestId: requestId,
+		}
+		var reply PutAppendReply
+
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		if ok == false || reply.WrongLeader == true {
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			continue
+		}
+		// request is sent successfully
+		ck.lastRequestId = requestId
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
