@@ -16,7 +16,8 @@ See [MIT6.824-2018](https://pdos.csail.mit.edu/6.824/schedule.html) for details.
 ## 进度
 - [x] **Lab1: mapreduce** 请移步[上一个项目](https://github.com/double-free/MIT6.824-2017-Chinese)
 - [x] **Lab2: Raft**
-  - [Part A notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2a)
-  - [Part B notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2b)
-  - [Part C notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2c)
+  - [Part A notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2a)
+  - [Part B notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2b)
+  - [Part C notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2c)
 - [ ] **Lab3: KV Raft**
+  - [Part A notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab3/lab3a)
