@@ -32,7 +32,7 @@ kvservers 将这些操作提交给 Raft，因此 Raft log 中就持有了一系�
 
 有个不错的图可以看看：
 
-![kvraft](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/images/kvraft.go)
+![kvraft](https://github.com/double-free/MIT6.824-2018-Chinese/blob/master/notes/images/kvraft.png)
 
 基本架构：
 - 每个 server 同时也是一个 Raft 节点
