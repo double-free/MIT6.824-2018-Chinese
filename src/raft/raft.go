@@ -600,6 +600,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		rf.persist()
+		rf.broadcastHeartbeat()
 		rf.mu.Unlock()
 	}
 

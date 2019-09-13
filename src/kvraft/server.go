@@ -54,6 +54,15 @@ type KVServer struct {
 	lastAppliedRequestId map[int64]int
 }
 
+// should be called with lock
+func (kv *KVServer) isDuplicateRequest(clientId int64, requestId int) bool {
+	appliedRequestId, ok := kv.lastAppliedRequestId[clientId]
+	if ok == false || requestId > appliedRequestId {
+		return false
+	}
+	return true
+}
+
 func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 	// return common part of GetReply and PutAppendReply
 	// i.e., WrongLeader
@@ -63,8 +72,6 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 	}
 
 	var wrongLeader bool
-	defer DPrintf("kvserver %d got %s() RPC, insert op %+v at %d, reply WrongLeader = %v",
-		kv.me, op.Name, op, index, wrongLeader)
 
 	kv.mu.Lock()
 	if _, ok := kv.dispatcher[index]; !ok {
@@ -85,8 +92,17 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 		}
 
 	case <-time.After(timeout):
-		wrongLeader = true
+		kv.mu.Lock()
+		if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+			wrongLeader = false
+		} else {
+			wrongLeader = true
+		}
+		kv.mu.Unlock()
 	}
+
+	DPrintf("kvserver %d got %s() RPC, insert op %+v at %d, reply WrongLeader = %v",
+		kv.me, op.Name, op, index, wrongLeader)
 	return wrongLeader
 }
 
@@ -181,29 +197,30 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				continue
 			}
 			op := msg.Command.(Op)
-			DPrintf("kvserver %d applied command %s at index %d", kv.me, op.Name, msg.CommandIndex)
+			DPrintf("kvserver %d applied command %s at index %d",
+				kv.me, op.Name, msg.CommandIndex)
 			kv.mu.Lock()
-			lastAppliedRequestId, ok := kv.lastAppliedRequestId[op.ClientId]
-			if ok == false || lastAppliedRequestId < op.RequestId {
-				switch op.Name {
-				case "Put":
-					kv.db[op.Key] = op.Value
-				case "Append":
-					kv.db[op.Key] += op.Value
-					// Get() does not need to modify db, skip
-				}
-				kv.lastAppliedRequestId[op.ClientId] = op.RequestId
+			if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
+				kv.mu.Unlock()
+				continue
 			}
-			ch, ok := kv.dispatcher[msg.CommandIndex]
-			kv.mu.Unlock()
+			switch op.Name {
+			case "Put":
+				kv.db[op.Key] = op.Value
+			case "Append":
+				kv.db[op.Key] += op.Value
+				// Get() does not need to modify db, skip
+			}
+			kv.lastAppliedRequestId[op.ClientId] = op.RequestId
 
-			if ok {
+			if ch, ok := kv.dispatcher[msg.CommandIndex]; ok {
 				notify := Notification{
 					ClientId:  op.ClientId,
 					RequestId: op.RequestId,
 				}
 				ch <- notify
 			}
+			kv.mu.Unlock()
 		}
 	}()
 
