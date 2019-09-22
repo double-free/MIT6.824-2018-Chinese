@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -49,9 +50,34 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db                   map[string]string
-	dispatcher           map[int]chan Notification
-	lastAppliedRequestId map[int64]int
+	db                   map[string]string         // 3A
+	dispatcher           map[int]chan Notification // 3A
+	lastAppliedRequestId map[int64]int             // 3A
+
+	appliedRaftLogIndex int // 3B
+}
+
+func (kv *KVServer) shouldTakeSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	if kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+		return true
+	}
+	return false
+}
+
+func (kv *KVServer) takeSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.db)
+	e.Encode(kv.lastAppliedRequestId)
+	appliedRaftLogIndex := kv.appliedRaftLogIndex
+	kv.mu.Unlock()
+
+	kv.rf.ReplaceLogWithSnapshot(appliedRaftLogIndex, w.Bytes())
 }
 
 // should be called with lock
@@ -71,6 +97,10 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 		return true
 	}
 
+	if kv.shouldTakeSnapshot() {
+		kv.takeSnapshot()
+	}
+
 	var wrongLeader bool
 
 	kv.mu.Lock()
@@ -81,9 +111,6 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 	kv.mu.Unlock()
 	select {
 	case notify := <-ch:
-		kv.mu.Lock()
-		delete(kv.dispatcher, index)
-		kv.mu.Unlock()
 		if notify.ClientId != op.ClientId || notify.RequestId != op.RequestId {
 			// leader has changed
 			wrongLeader = true
@@ -100,9 +127,12 @@ func (kv *KVServer) waitApplying(op Op, timeout time.Duration) bool {
 		}
 		kv.mu.Unlock()
 	}
-
 	DPrintf("kvserver %d got %s() RPC, insert op %+v at %d, reply WrongLeader = %v",
 		kv.me, op.Name, op, index, wrongLeader)
+
+	kv.mu.Lock()
+	delete(kv.dispatcher, index)
+	kv.mu.Unlock()
 	return wrongLeader
 }
 
@@ -159,6 +189,19 @@ func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 }
 
+func (kv *KVServer) installSnapshot(snapshot []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if snapshot != nil {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		if d.Decode(&kv.db) != nil ||
+			d.Decode(&kv.lastAppliedRequestId) != nil {
+			DPrintf("kvserver %d fails to recover from snapshot", kv.me)
+		}
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -190,15 +233,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	// 3B: recover from snapshot
+	snapshot := persister.ReadSnapshot()
+	kv.installSnapshot(snapshot)
+
 	// You may need initialization code here.
 	go func() {
 		for msg := range kv.applyCh {
 			if msg.CommandValid == false {
+				switch msg.Command.(string) {
+				case "InstallSnapshot":
+					kv.installSnapshot(msg.CommandData)
+				}
 				continue
 			}
+
 			op := msg.Command.(Op)
-			DPrintf("kvserver %d applied command %s at index %d",
-				kv.me, op.Name, msg.CommandIndex)
+			DPrintf("kvserver %d start applying command %s at index %d, request id %d, client id %d",
+				kv.me, op.Name, msg.CommandIndex, op.RequestId, op.ClientId)
 			kv.mu.Lock()
 			if kv.isDuplicateRequest(op.ClientId, op.RequestId) {
 				kv.mu.Unlock()
@@ -212,6 +264,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				// Get() does not need to modify db, skip
 			}
 			kv.lastAppliedRequestId[op.ClientId] = op.RequestId
+			kv.appliedRaftLogIndex = msg.CommandIndex
 
 			if ch, ok := kv.dispatcher[msg.CommandIndex]; ok {
 				notify := Notification{
@@ -220,7 +273,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 				ch <- notify
 			}
+
 			kv.mu.Unlock()
+			DPrintf("kvserver %d applied command %s at index %d, request id %d, client id %d",
+				kv.me, op.Name, msg.CommandIndex, op.RequestId, op.ClientId)
 		}
 	}()
 
