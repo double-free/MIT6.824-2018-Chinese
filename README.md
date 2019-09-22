@@ -19,5 +19,6 @@ See [MIT6.824-2018](https://pdos.csail.mit.edu/6.824/schedule.html) for details.
   - [Part A notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2a)
   - [Part B notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2b)
   - [Part C notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab2/lab2c)
-- [ ] **Lab3: KV Raft**
+- [x] **Lab3: KV Raft**
   - [Part A notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab3/lab3a)
+  - [Part B notes](https://github.com/double-free/MIT6.824-2018-Chinese/tree/master/notes/lab3/lab3b)
