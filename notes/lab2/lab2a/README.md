@@ -31,7 +31,7 @@
   - 处理 `RequestVote`
   - `electionTimer` 超时
 
-- Follower
+- Candidate
   - 处理 `AppendEntries`
   - 处理 `RequestVote`
   - `electionTimer` 超时
