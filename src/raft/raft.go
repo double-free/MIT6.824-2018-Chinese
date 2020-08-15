@@ -64,7 +64,8 @@ func (rf *Raft) convertTo(s NodeState) {
 	switch s {
 	case Follower:
 		rf.heartbeatTimer.Stop()
-		rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+		resetTimer(rf.electionTimer,
+			randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 		rf.votedFor = -1
 
 	case Candidate:
@@ -81,7 +82,7 @@ func (rf *Raft) convertTo(s NodeState) {
 
 		rf.electionTimer.Stop()
 		rf.broadcastHeartbeat()
-		rf.heartbeatTimer.Reset(HeartbeatInterval)
+		resetTimer(rf.heartbeatTimer, HeartbeatInterval)
 	}
 }
 
@@ -355,7 +356,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm // not used, for better logging
 	reply.VoteGranted = true
 	// reset timer after grant vote
-	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+	resetTimer(rf.electionTimer,
+		randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 }
 
 type AppendEntriesArgs struct {
@@ -395,7 +397,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// reset election timer even log does not match
 	// args.LeaderId is the current term's Leader
-	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+	resetTimer(rf.electionTimer,
+		randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
 	if args.PrevLogIndex <= rf.snapshottedIndex {
 		reply.Success = true
@@ -584,7 +587,6 @@ func (rf *Raft) startElection() {
 	defer rf.persist()
 
 	rf.currentTerm += 1
-	rf.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
 
 	lastLogIndex := len(rf.logs) - 1
 	args := RequestVoteArgs{
@@ -869,23 +871,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func(node *Raft) {
 		for {
 			select {
-			case <-rf.electionTimer.C:
-				rf.mu.Lock()
-				if rf.state == Follower {
-					// rf.startElection() is called in conversion to Candidate
-					rf.convertTo(Candidate)
+			case <-node.electionTimer.C:
+				node.mu.Lock()
+				// we know the timer has stopped now
+				// no need to call Stop()
+				node.electionTimer.Reset(randTimeDuration(ElectionTimeoutLower, ElectionTimeoutUpper))
+				if node.state == Follower {
+					// Raft::startElection() is called in conversion to Candidate
+					node.convertTo(Candidate)
 				} else {
-					rf.startElection()
+					node.startElection()
 				}
-				rf.mu.Unlock()
+				node.mu.Unlock()
 
-			case <-rf.heartbeatTimer.C:
-				rf.mu.Lock()
-				if rf.state == Leader {
-					rf.broadcastHeartbeat()
-					rf.heartbeatTimer.Reset(HeartbeatInterval)
+			case <-node.heartbeatTimer.C:
+				node.mu.Lock()
+				if node.state == Leader {
+					node.broadcastHeartbeat()
+					// we know the timer has stopped now
+					// no need to call Stop()
+					node.heartbeatTimer.Reset(HeartbeatInterval)
 				}
-				rf.mu.Unlock()
+				node.mu.Unlock()
 			}
 		}
 	}(rf)
@@ -896,4 +903,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func randTimeDuration(lower, upper time.Duration) time.Duration {
 	num := rand.Int63n(upper.Nanoseconds()-lower.Nanoseconds()) + lower.Nanoseconds()
 	return time.Duration(num) * time.Nanosecond
+}
+
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C: //try to drain from the channel
+		default:
+		}
+	}
+	timer.Reset(d)
 }
