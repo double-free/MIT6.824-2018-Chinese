@@ -8,5 +8,6 @@ export "GOPATH=$(git rev-parse --show-toplevel)"
 cd "${GOPATH}/src/$1"
 for ((i=0;i<$3;i++))
 do
-	time go test -run $2
+	time go test -run $2 &
 done
+wait
