@@ -6,8 +6,24 @@ if [ $# -ne 3 ]; then
 fi
 export "GOPATH=$(git rev-parse --show-toplevel)"
 cd "${GOPATH}/src/$1"
-for ((i=0;i<$3;i++))
-do
-	time go test -run $2 &
+logicalCpuCount=$([ $(uname) = 'Darwin' ] && 
+                  sysctl -n hw.logicalcpu_max || 
+                  lscpu -p | egrep -v '^#' | wc -l)
+
+
+for ((i=0;i<$3;)); do
+	parallelJobCount=$(($3 - $i))
+	if [[ $parallelJobCount -ge $logicalCpuCount ]]; then
+		parallelJobCount=$logicalCpuCount
+	fi	
+
+	echo "Run $parallelJobCount tasks in parallel"
+
+	for ((j=0;j<$parallelJobCount;j++)); do
+		time go test -run $2 &
+	done
+
+	wait
+
+	i=$(($i + $parallelJobCount))
 done
-wait
